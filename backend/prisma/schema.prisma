@@ -1,0 +1,813 @@
+// VivahSetu schema.
+// Phase 1: User, RefreshToken, minimal Vendor.
+// Phase 2: vendor marketplace — categories, portfolio, packages, wedding
+// events, favorites, and admin vendor/category management.
+// Phase 3: vendor availability calendar and date-based vendor search.
+// Phase 4: booking requests (with the accept-time double-booking guard
+// documented on VendorAvailability below) and customer<->vendor messaging.
+// Phase 5: Razorpay advance payment, webhook processing, booking/payment
+// state integration, and a commission accounting foundation.
+// Phase 6: verified customer reviews (with a denormalized vendor rating
+// aggregate), an in-app notification system, and admin customer
+// management/analytics on top of the existing admin vendor/category/
+// booking/payment moderation.
+//
+// Money: every price/amount field in this schema (Vendor.startingPrice,
+// VendorPackage.price, Booking.totalAmount, Payment.amount, etc.) is a
+// whole-rupee Int, not a Decimal - this app doesn't need sub-rupee
+// precision, and Int keeps every money field consistent across the
+// codebase and trivial to serialize as plain JSON numbers. Razorpay's API
+// itself works in paise (integer smallest-unit), so that rupees<->paise
+// conversion happens at exactly one boundary - inside
+// `backend/src/payments/razorpayProvider.ts` - and nowhere else. Every
+// other model, service and API response in this app deals in whole rupees.
+//
+// Date handling: every calendar-date field in this schema (WeddingEvent
+// .weddingDate/.endDate, VendorAvailability.date) is stored as a UTC
+// midnight instant representing a specific calendar day, never a "local
+// time" instant. Application code must always parse/format these through
+// backend/src/utils/dateOnly.ts (parseDateOnly/formatDateOnly) or the
+// frontend's mirror (src/utils/dateOnly.ts) - never through
+// `new Date(str).toLocaleDateString()`-style local-timezone conversion -
+// so a date can never silently shift by a day.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  CUSTOMER
+  VENDOR
+  ADMIN
+}
+
+// A vendor profile always starts PENDING (awaiting admin review). Only an
+// admin can move it to VERIFIED or REJECTED — see requireRole(ADMIN) on the
+// admin verification endpoint; a vendor can never set this on itself.
+enum VerificationStatus {
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+enum PortfolioMediaType {
+  IMAGE
+  VIDEO
+}
+
+// AVAILABLE / UNAVAILABLE / BLOCKED are vendor-settable via the Phase 3 API.
+// BOOKED is set only by booking.service.acceptBooking, via the atomic
+// conditional update documented on VendorAvailability below - it's what
+// actually prevents double-booking. Treating BOOKED as "not available"
+// everywhere availability is read (search filtering, public calendar) means
+// Phase 4 could start writing it without any Phase 3 code needing to change.
+enum AvailabilityStatus {
+  AVAILABLE
+  UNAVAILABLE
+  BLOCKED
+  BOOKED
+}
+
+// Phase 4 implements PENDING -> ACCEPTED/DECLINED/CANCELLED and
+// ACCEPTED -> CANCELLED. Phase 5 adds ACCEPTED -> CONFIRMED, but only as a
+// side effect of a verified captured advance payment
+// (payment.service.applyPaymentOutcome calling
+// booking.service.confirmBookingAfterPayment) - there is no route that lets
+// any client set status=CONFIRMED directly. Phase 6 adds
+// CONFIRMED -> COMPLETED, vendor-triggered (PATCH
+// /vendors/me/bookings/:id/complete) and only once the event date has
+// passed - see booking.service.completeBooking. A COMPLETED booking is what
+// makes its customer eligible to leave a review (see Review below).
+// PAYMENT_PENDING stays reserved/unreachable (Phase 5 tracks in-flight
+// payment state on Payment.status, not on Booking.status - see
+// BookingPaymentStatus below). See ALLOWED_TRANSITIONS in booking.service.ts.
+enum BookingStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+  CANCELLED
+  COMPLETED
+  PAYMENT_PENDING
+  CONFIRMED
+}
+
+// A lightweight aggregate mirror on Booking of "where things stand
+// payment-wise" for cheap list/detail display - Payment rows remain the
+// detailed, auditable source of truth (see Payment below).
+enum BookingPaymentStatus {
+  NOT_REQUIRED
+  PENDING
+  PARTIALLY_PAID
+  PAID
+  FAILED
+  REFUNDED
+}
+
+enum PaymentProviderName {
+  RAZORPAY
+}
+
+// CREATED: Payment row exists, provider order not yet created.
+// PENDING: provider order created, awaiting the customer to complete checkout.
+// AUTHORIZED: provider has authorized the charge (reserved for providers/flows
+//   that separate authorize from capture - Razorpay auto-captures by default,
+//   so most payments here go PENDING -> CAPTURED directly).
+// CAPTURED: money has been verified as actually collected - the only status
+//   that ever triggers a booking to become CONFIRMED.
+// FAILED / CANCELLED: this attempt did not result in captured money.
+// REFUNDED / PARTIALLY_REFUNDED: a captured payment was later refunded.
+enum PaymentStatus {
+  CREATED
+  PENDING
+  AUTHORIZED
+  CAPTURED
+  FAILED
+  CANCELLED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+// BALANCE and REFUND exist for forward compatibility (see Booking's
+// balance-amount comment below) - Phase 5 only ever creates ADVANCE and
+// REFUND (a refund is itself a Payment row - see Payment.refundOfPaymentId).
+enum PaymentType {
+  ADVANCE
+  BALANCE
+  REFUND
+}
+
+enum CommissionType {
+  PERCENTAGE
+  FIXED
+}
+
+// PENDING: commission computed but the underlying payment isn't captured yet
+//   (not currently reachable - Commission rows are only created once a
+//   payment is already CAPTURED - but kept for a future "commission accrues
+//   before capture" model).
+// APPLIED: the commission is booked against the captured payment.
+// REFUNDED / CANCELLED: the underlying payment was refunded/reversed.
+enum CommissionStatus {
+  PENDING
+  APPLIED
+  REFUNDED
+  CANCELLED
+}
+
+enum WebhookProcessStatus {
+  RECEIVED
+  PROCESSED
+  IGNORED
+  FAILED
+}
+
+// PENDING: awaiting moderation (the default - see REVIEW_AUTO_PUBLISH in
+// config/env.ts for the alternative). PUBLISHED: visible on the vendor's
+// public profile and counted in its rating aggregate. HIDDEN: was
+// published, an admin pulled it from public view (moderation action, not a
+// delete - history is preserved). REJECTED: an admin declined it before it
+// was ever public. Only PUBLISHED reviews ever affect Vendor.averageRating/
+// reviewCount - see review.service.ts.
+enum ReviewStatus {
+  PENDING
+  PUBLISHED
+  HIDDEN
+  REJECTED
+}
+
+// Kept intentionally flat (a string enum, not a typed payload per type) so
+// adding a new notification type later is a one-line enum change, not a
+// schema migration for a new payload shape - see notification.service.ts.
+enum NotificationType {
+  BOOKING_CREATED
+  BOOKING_ACCEPTED
+  BOOKING_DECLINED
+  BOOKING_CANCELLED
+  BOOKING_CONFIRMED
+  BOOKING_COMPLETED
+  PAYMENT_SUCCESS
+  PAYMENT_FAILED
+  PAYMENT_REFUNDED
+  NEW_MESSAGE
+  REVIEW_RECEIVED
+  REVIEW_PUBLISHED
+  REVIEW_REJECTED
+  VENDOR_VERIFIED
+  VENDOR_REJECTED
+  VENDOR_ACTIVATED
+  VENDOR_DEACTIVATED
+}
+
+model User {
+  id           String   @id @default(uuid())
+  name         String
+  email        String   @unique
+  phone        String?
+  passwordHash String
+  role         Role     @default(CUSTOMER)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  vendor        Vendor?
+  refreshTokens RefreshToken[]
+  weddingEvents WeddingEvent[]
+  favorites     FavoriteVendor[]
+  auditLogs     AdminAuditLog[]
+  bookings      Booking[]
+  conversations Conversation[]
+  messages      Message[]
+  payments      Payment[]
+  reviews       Review[]
+  notifications Notification[]
+
+  @@map("users")
+}
+
+// Hashed refresh tokens, one row per active session, so logout/refresh can be
+// enforced and revoked server-side instead of trusting a stateless JWT alone.
+model RefreshToken {
+  id        String    @id @default(uuid())
+  tokenHash String    @unique
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime  @default(now())
+  revokedAt DateTime?
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+model VendorCategory {
+  id          String   @id @default(uuid())
+  name        String
+  slug        String   @unique
+  description String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  vendors                Vendor[]
+  weddingEventCategories WeddingEventCategory[]
+
+  @@map("vendor_categories")
+}
+
+// One Vendor per User (a vendor business account). Portfolio and packages
+// hang off this via their own vendorId foreign key so they can be queried
+// and paginated independently of the vendor row itself.
+model Vendor {
+  id                 String             @id @default(uuid())
+  userId             String             @unique
+  user               User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  businessName       String
+  slug               String             @unique
+  description        String?
+  city               String
+  locality           String?
+  address            String?
+  phone              String?
+  email              String?
+  categoryId         String?
+  category           VendorCategory?    @relation(fields: [categoryId], references: [id])
+  startingPrice      Int?
+  yearsExperience    Int?
+  // Only ever incremented by the system once bookings exist (Phase 3+).
+  // Never client-writable.
+  eventsCompleted    Int                @default(0)
+  verificationStatus VerificationStatus @default(PENDING)
+  isActive           Boolean            @default(true)
+  // Denormalized aggregate mirror of this vendor's PUBLISHED reviews only -
+  // recomputed (never incrementally patched) inside the same transaction as
+  // any review status change, so it can never drift from the real data and
+  // never race under concurrent moderation actions (see
+  // review.service.recalculateVendorRating). Reading these two columns is
+  // O(1) - the alternative (aggregating vendor_reviews on every profile/
+  // search request) is exactly the "expensive full-table calculation on
+  // every request" the Phase 6 spec says to avoid.
+  averageRating      Float              @default(0)
+  reviewCount        Int                @default(0)
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  portfolio     VendorPortfolio[]
+  packages      VendorPackage[]
+  favoritedBy   FavoriteVendor[]
+  availability  VendorAvailability[]
+  bookings      Booking[]
+  conversations Conversation[]
+  payments      Payment[]
+  commissions   Commission[]
+  reviews       Review[]
+
+  @@index([categoryId])
+  @@index([city])
+  @@index([locality])
+  @@index([averageRating])
+  @@index([verificationStatus])
+  @@index([isActive])
+  @@index([startingPrice])
+  @@map("vendors")
+}
+
+// One row per (vendor, calendar day). The unique constraint below is the
+// concurrency-safety foundation Phase 4 booking must rely on: to claim a
+// date, Phase 4 should do a single conditional update -
+//   UPDATE vendor_availability SET status = 'BOOKED'
+//   WHERE vendor_id = ? AND date = ? AND status = 'AVAILABLE'
+// (Prisma: `updateMany({ where: { vendorId, date, status: AVAILABLE }, data: { status: BOOKED } })`
+// and check the returned count is 1) - never a read-then-write of the
+// current status, which would race under concurrent booking attempts. The
+// @@unique guarantees at most one row can ever exist for that vendor/date,
+// so there is exactly one row to win the race on.
+model VendorAvailability {
+  id        String             @id @default(uuid())
+  vendorId  String
+  vendor    Vendor             @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  date      DateTime           @db.Date
+  status    AvailabilityStatus
+  // Private to the vendor (and visible to admins) - never returned by the
+  // public availability endpoints.
+  note      String?
+  createdAt DateTime           @default(now())
+  updatedAt DateTime           @updatedAt
+
+  @@unique([vendorId, date])
+  @@index([vendorId, date])
+  @@index([date, status])
+  @@map("vendor_availability")
+}
+
+// Minimal, reusable audit trail - Phase 1/2 had no audit mechanism yet, so
+// this is intentionally small (who did what to what, when) rather than a
+// general-purpose audit platform. Currently only written to by admin
+// availability corrections (see admin.controller.adminSetVendorAvailability).
+model AdminAuditLog {
+  id         String   @id @default(uuid())
+  adminId    String
+  admin      User     @relation(fields: [adminId], references: [id])
+  action     String
+  targetType String
+  targetId   String
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  @@index([adminId])
+  @@index([targetType, targetId])
+  @@map("admin_audit_logs")
+}
+
+model VendorPortfolio {
+  id           String             @id @default(uuid())
+  vendorId     String
+  vendor       Vendor             @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  type         PortfolioMediaType @default(IMAGE)
+  url          String
+  thumbnailUrl String?
+  title        String?
+  description  String?
+  sortOrder    Int                @default(0)
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+
+  @@index([vendorId])
+  @@map("vendor_portfolio")
+}
+
+model VendorPackage {
+  id                String   @id @default(uuid())
+  vendorId          String
+  vendor            Vendor   @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  name              String
+  description       String?
+  price             Int
+  // Whole-percent (0-100) of `price` required as an advance payment when a
+  // booking of this package is confirmed. Snapshotted onto Booking.advanceAmount
+  // at booking-creation time (see Booking below), so a vendor changing this
+  // later never changes what an already-created booking owes.
+  advancePercentage Int      @default(20)
+  isActive          Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  items    VendorPackageItem[]
+  bookings Booking[]
+
+  @@index([vendorId])
+  @@map("vendor_packages")
+}
+
+model VendorPackageItem {
+  id          String        @id @default(uuid())
+  packageId   String
+  package     VendorPackage @relation(fields: [packageId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  sortOrder   Int           @default(0)
+
+  @@index([packageId])
+  @@map("vendor_package_items")
+}
+
+// A customer's wedding/event. A WeddingEvent can have many Bookings (one
+// per vendor booked for it); a Booking snapshots its own weddingDate off of
+// this event at creation time (see Booking below), so later edits to this
+// event's own dates never retroactively change an existing booking.
+model WeddingEvent {
+  id          String    @id @default(uuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name        String
+  city        String
+  weddingDate DateTime
+  endDate     DateTime?
+  guestCount  Int?
+  budgetMin   Int?
+  budgetMax   Int?
+  notes       String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  interestedCategories WeddingEventCategory[]
+  bookings             Booking[]
+
+  @@index([userId])
+  @@index([weddingDate])
+  @@map("wedding_events")
+}
+
+// Which vendor categories a couple said they're interested in for a given
+// event. A join table rather than a comma-separated string so it stays
+// queryable (e.g. "weddings looking for photographers").
+model WeddingEventCategory {
+  id             String         @id @default(uuid())
+  weddingEventId String
+  weddingEvent   WeddingEvent   @relation(fields: [weddingEventId], references: [id], onDelete: Cascade)
+  categoryId     String
+  category       VendorCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  createdAt      DateTime       @default(now())
+
+  @@unique([weddingEventId, categoryId])
+  @@index([weddingEventId])
+  @@index([categoryId])
+  @@map("wedding_event_categories")
+}
+
+model FavoriteVendor {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  vendorId  String
+  vendor    Vendor   @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([userId, vendorId])
+  @@index([userId])
+  @@index([vendorId])
+  @@map("favorite_vendors")
+}
+
+// One row per calendar year, incremented atomically inside the same
+// transaction that creates a Booking, to generate human-readable sequential
+// numbers like "BOOK-2027-000001". Postgres row-level locking on the
+// upsert/update serializes concurrent increments, so this is race-safe
+// without a retry loop.
+model BookingCounter {
+  year  Int @id
+  count Int @default(0)
+
+  @@map("booking_counters")
+}
+
+// A customer's request to book a vendor for their wedding. Package details
+// are snapshotted at creation time (name/description/price) so a vendor
+// later editing or deleting that VendorPackage never changes what an
+// existing booking shows or how much it's for - `packageId` is nullable
+// with onDelete: SetNull specifically so a deleted package doesn't take the
+// booking with it. `totalAmount` always comes from the server-side package
+// price at creation time, never from the request body.
+//
+// Double-booking prevention: creating a booking only *checks* that
+// VendorAvailability is AVAILABLE for every required date (status PENDING
+// - just a request). Actually claiming the date happens in
+// booking.service.acceptBooking, which atomically flips each date's
+// VendorAvailability from AVAILABLE to BOOKED via a conditional
+// updateMany (see the comment on VendorAvailability above) inside the same
+// transaction as the ACCEPTED status change. If any date has already been
+// claimed by another accepted booking, the conditional update affects
+// fewer rows than expected and the whole transaction is rolled back with a
+// 409 - so two accepted bookings can never overlap for the same vendor,
+// without any application-level locking.
+model Booking {
+  id            String @id @default(uuid())
+  bookingNumber String @unique
+
+  customerId String
+  customer   User           @relation(fields: [customerId], references: [id])
+  vendorId   String
+  vendor     Vendor         @relation(fields: [vendorId], references: [id])
+  eventId    String
+  event      WeddingEvent   @relation(fields: [eventId], references: [id])
+  packageId  String?
+  package    VendorPackage? @relation(fields: [packageId], references: [id], onDelete: SetNull)
+
+  eventNameSnapshot          String
+  packageNameSnapshot        String?
+  packageDescriptionSnapshot String?
+  packagePriceSnapshot       Int?
+
+  weddingDate  DateTime  @db.Date
+  eventEndDate DateTime? @db.Date
+  guestCount   Int?
+
+  // `advanceAmount` is snapshotted from the package's `advancePercentage` at
+  // booking-creation time (Math.round(totalAmount * advancePercentage / 100)),
+  // same snapshot philosophy as the package name/description/price above.
+  // `advancePaidAmount` and `paymentStatus` are a cheap aggregate mirror for
+  // list/detail display - Payment rows are the real, auditable source of
+  // truth (see Payment below); this app deliberately doesn't persist a
+  // `balanceAmount` column since it's always just `totalAmount - advanceAmount`
+  // and storing a fully-derived value risks drifting out of sync.
+  totalAmount       Int
+  advanceAmount     Int?
+  advancePaidAmount Int                  @default(0)
+  paymentStatus     BookingPaymentStatus @default(NOT_REQUIRED)
+
+  customerNotes String?
+  vendorNotes   String?
+
+  status BookingStatus @default(PENDING)
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  acceptedAt  DateTime?
+  declinedAt  DateTime?
+  cancelledAt DateTime?
+  // Set only by payment.service.applyPaymentOutcome, the moment a captured
+  // advance payment moves this booking PENDING/ACCEPTED... to CONFIRMED -
+  // never set by any client-facing endpoint directly.
+  confirmedAt DateTime?
+  // Set only by booking.service.completeBooking (vendor-triggered, Phase 6),
+  // the moment a CONFIRMED booking moves to COMPLETED. This is what makes
+  // the booking's customer eligible to review the vendor - see Review below.
+  completedAt DateTime?
+
+  conversations Conversation[]
+  payments      Payment[]
+  Commission    Commission[]
+  review        Review?
+
+  @@index([customerId])
+  @@index([vendorId])
+  @@index([eventId])
+  @@index([status])
+  @@index([weddingDate])
+  @@map("bookings")
+}
+
+// One conversation per (customer, vendor) pair - reused across however many
+// bookings/inquiries they have, rather than spawning a new thread per
+// booking (see @@unique below). `bookingId` records which booking (if any)
+// the conversation is currently associated with on the UI (e.g. the
+// "Message Vendor" button from a booking detail page); it's nullable so a
+// pre-booking inquiry conversation can exist with no booking yet.
+model Conversation {
+  id         String   @id @default(uuid())
+  customerId String
+  customer   User     @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  vendorId   String
+  vendor     Vendor   @relation(fields: [vendorId], references: [id], onDelete: Cascade)
+  bookingId  String?
+  booking    Booking? @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  messages Message[]
+
+  @@unique([customerId, vendorId])
+  @@index([customerId])
+  @@index([vendorId])
+  @@index([bookingId])
+  @@map("conversations")
+}
+
+model Message {
+  id             String       @id @default(uuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  senderId       String
+  sender         User         @relation(fields: [senderId], references: [id], onDelete: Cascade)
+  body           String
+  // Whether the *other* participant has read it - never the sender.
+  isRead         Boolean      @default(false)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@index([conversationId, createdAt])
+  @@index([senderId])
+  @@map("messages")
+}
+
+// One row per "attempt to collect money for a booking" - clicking "Pay
+// Advance" creates one Payment (CREATED), which becomes a Razorpay order
+// (PENDING). If that attempt is ultimately FAILED/CANCELLED, retrying
+// creates a *new* Payment row rather than reusing/overwriting this one, so
+// every attempt - successful or not - stays in the history
+// (`booking.payments`) exactly as it happened. `providerSignature` is a
+// verification artifact only, and is intentionally never returned by any
+// API response (see payment.controller.ts's response DTOs).
+model Payment {
+  id         String  @id @default(uuid())
+  bookingId  String
+  booking    Booking @relation(fields: [bookingId], references: [id])
+  customerId String
+  customer   User    @relation(fields: [customerId], references: [id])
+  vendorId   String
+  vendor     Vendor  @relation(fields: [vendorId], references: [id])
+
+  provider          PaymentProviderName @default(RAZORPAY)
+  providerOrderId   String?             @unique
+  providerPaymentId String?             @unique
+  providerSignature String?
+
+  amount   Int
+  currency String @default("INR")
+
+  status      PaymentStatus @default(CREATED)
+  paymentType PaymentType   @default(ADVANCE)
+
+  // Set only for a PaymentType.REFUND row - the Payment it refunds.
+  refundOfPaymentId String?
+  refundOf          Payment?  @relation("PaymentRefunds", fields: [refundOfPaymentId], references: [id])
+  refunds           Payment[] @relation("PaymentRefunds")
+
+  failureReason String?
+  // Provider metadata safe to retain for support/debugging (e.g. Razorpay's
+  // payment method, bank/wallet name) - never card/CVV/UPI PIN, which
+  // Razorpay Checkout never even transmits to this backend in the first place.
+  metadata      Json?
+  paidAt        DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  attempts   PaymentAttempt[]
+  commission Commission?
+
+  @@index([bookingId])
+  @@index([customerId])
+  @@index([vendorId])
+  @@index([status])
+  @@map("payments")
+}
+
+// One row per individual checkout/webhook outcome observed for a Payment -
+// a single Razorpay order can see more than one charge attempt (e.g. a
+// card decline followed by a successful UPI attempt) before the Payment
+// reaches a terminal state. The parent Payment.status always reflects the
+// latest/current outcome; this table is the append-only, auditable detail
+// behind it (never overwritten).
+model PaymentAttempt {
+  id        String  @id @default(uuid())
+  paymentId String
+  payment   Payment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+
+  provider          PaymentProviderName @default(RAZORPAY)
+  providerOrderId   String?
+  providerPaymentId String?
+
+  amount       Int
+  status       PaymentStatus
+  errorCode    String?
+  errorMessage String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([paymentId])
+  @@map("payment_attempts")
+}
+
+// Platform commission accounting for one captured Payment - Phase 5 only
+// *records* this; it never automatically transfers `vendorAmount` to the
+// vendor (vendor payouts/settlement are an explicit later phase). One
+// Commission per Payment (not per Booking), since a future BALANCE payment
+// on the same booking would earn its own commission row.
+model Commission {
+  id        String  @id @default(uuid())
+  bookingId String
+  booking   Booking @relation(fields: [bookingId], references: [id])
+  vendorId  String
+  vendor    Vendor  @relation(fields: [vendorId], references: [id])
+  paymentId String  @unique
+  payment   Payment @relation(fields: [paymentId], references: [id])
+
+  type       CommissionType @default(PERCENTAGE)
+  // Whole-percent (e.g. 10 = 10%) - the platform-wide default from
+  // PLATFORM_COMMISSION_PERCENTAGE at the time this was calculated,
+  // snapshotted so a later config change never rewrites historical
+  // commission records. Null when `type` is FIXED.
+  percentage Int?
+
+  grossAmount      Int
+  commissionAmount Int
+  vendorAmount     Int
+
+  status CommissionStatus @default(APPLIED)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([vendorId])
+  @@index([bookingId])
+  @@map("commissions")
+}
+
+// Idempotency ledger for provider webhooks - `@@unique([provider,
+// providerEventId])` is what makes a redelivered webhook a no-op: the
+// second delivery's insert attempt collides on this constraint, is caught,
+// and the handler returns success without reapplying any state transition.
+// `payload` is the raw parsed webhook body, kept for support/debugging (no
+// card/CVV/PIN data ever appears in a Razorpay webhook payload).
+model PaymentWebhookEvent {
+  id              String               @id @default(uuid())
+  provider        PaymentProviderName  @default(RAZORPAY)
+  providerEventId String
+  eventType       String
+  payload         Json
+  status          WebhookProcessStatus @default(RECEIVED)
+  processedAt     DateTime?
+  createdAt       DateTime             @default(now())
+
+  @@unique([provider, providerEventId])
+  @@map("payment_webhook_events")
+}
+
+// A customer's review of a vendor, always tied to one specific COMPLETED
+// booking (see BookingStatus above and review.service.createReview's
+// eligibility check) - @@unique([bookingId]) is the "one review per
+// booking" rule, enforced at the database level, not just in application
+// code. `vendorId`/`customerId` are denormalized off the booking (not
+// derived via a join every read) purely for query convenience - they're
+// set once at creation time from the booking and never change.
+model Review {
+  id         String  @id @default(uuid())
+  bookingId  String  @unique
+  booking    Booking @relation(fields: [bookingId], references: [id])
+  customerId String
+  customer   User    @relation(fields: [customerId], references: [id])
+  vendorId   String
+  vendor     Vendor  @relation(fields: [vendorId], references: [id])
+
+  rating  Int
+  title   String?
+  comment String
+
+  status ReviewStatus @default(PENDING)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([vendorId, status])
+  @@index([customerId])
+  @@index([status])
+  @@map("reviews")
+}
+
+// In-app notification, one row per (user, event). Deliberately flat -
+// `type` plus freeform `title`/`message` strings computed once at creation
+// time by notification.service.ts, rather than a typed payload the
+// frontend has to interpret per type - and `entityType`/`entityId` (e.g.
+// "booking/<id>") are just enough for the frontend to know where a click
+// should navigate, without embedding a full nested object. See
+// notification.service.ts for the single write path every business
+// service goes through - no controller ever creates one of these directly.
+model Notification {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  type    NotificationType
+  title   String
+  message String
+
+  entityType String?
+  entityId   String?
+
+  isRead Boolean   @default(false)
+  readAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([isRead])
+  @@index([createdAt])
+  @@index([userId, isRead])
+  @@map("notifications")
+}
