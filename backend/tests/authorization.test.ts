@@ -15,6 +15,7 @@ async function createUserAndLogin(role: Role, email: string) {
   const res = await request(app).post("/api/v1/auth/login").send({ email, password: PASSWORD });
   return res.body.data.accessToken as string;
 }
+//test
 
 describe("Authentication and role-based authorization", () => {
   it("rejects unauthenticated access to a protected endpoint", async () => {
