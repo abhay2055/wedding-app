@@ -13,6 +13,8 @@ export function createApp(): Express {
   const app = express();
 
   app.disable("x-powered-by");
+  // Behind nginx in production: trust its X-Forwarded-* headers (client IP, protocol).
+  app.set("trust proxy", 1);
   app.use(helmet());
   app.use(
     cors({
